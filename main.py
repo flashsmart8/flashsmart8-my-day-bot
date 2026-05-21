@@ -26,7 +26,7 @@ from scheduler import start_scheduler
 # ──────────────────────────────────────────────
 #  Config
 # ──────────────────────────────────────────────
-FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "")
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://myday-94aca-default-rtdb.europe-west1.firebasedatabase.app")
 FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "")
 FIREBASE_EMAIL = os.environ.get("FIREBASE_EMAIL", "")
 FIREBASE_PASSWORD = os.environ.get("FIREBASE_PASSWORD", "")
@@ -66,19 +66,19 @@ async def fb_auth() -> str:
 
 async def fb_get(path: str) -> dict | list | None:
     token = await fb_auth()
-    url = f"{FIREBASE_DB_URL}/myday/{path}.json?auth={token}"
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
     async with httpx.AsyncClient() as client:
         r = await client.get(url, timeout=10)
         if r.status_code == 401:
             _fb_token["id"] = None
             token = await fb_auth()
-            r = await client.get(f"{FIREBASE_DB_URL}/myday/{path}.json?auth={token}", timeout=10)
+            r = await client.get(f"{FIREBASE_DB_URL}/{path}.json?auth={token}", timeout=10)
         return r.json() if r.status_code == 200 else None
 
 
 async def fb_put(path: str, data: dict) -> bool:
     token = await fb_auth()
-    url = f"{FIREBASE_DB_URL}/myday/{path}.json?auth={token}"
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
     async with httpx.AsyncClient() as client:
         r = await client.put(url, json=data, timeout=10)
         return r.status_code == 200
@@ -86,7 +86,7 @@ async def fb_put(path: str, data: dict) -> bool:
 
 async def fb_patch(path: str, data: dict) -> bool:
     token = await fb_auth()
-    url = f"{FIREBASE_DB_URL}/myday/{path}.json?auth={token}"
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
     async with httpx.AsyncClient() as client:
         r = await client.patch(url, json=data, timeout=10)
         return r.status_code == 200
@@ -95,7 +95,7 @@ async def fb_patch(path: str, data: dict) -> bool:
 async def fb_post(path: str, data: dict) -> str | None:
     """Push new item, return generated key."""
     token = await fb_auth()
-    url = f"{FIREBASE_DB_URL}/myday/{path}.json?auth={token}"
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
     async with httpx.AsyncClient() as client:
         r = await client.post(url, json=data, timeout=10)
         if r.status_code == 200:
