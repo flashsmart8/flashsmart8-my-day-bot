@@ -1,0 +1,647 @@
+"""
+Мій день — персональний AI-помічник (сервер)
+FastAPI + Claude API + Firebase RTDB
+"""
+import os
+import json
+import time
+import hashlib
+import secrets
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from jose import jwt, JWTError
+
+from crypto_utils import encrypt_data, decrypt_data
+from ai_engine import parse_intent, generate_briefing
+from weather_service import get_weather
+from holidays import get_today_holidays
+from scheduler import start_scheduler
+
+# ──────────────────────────────────────────────
+#  Config
+# ──────────────────────────────────────────────
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://myday-94aca-default-rtdb.europe-west1.firebasedatabase.app")
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "")
+FIREBASE_EMAIL = os.environ.get("FIREBASE_EMAIL", "")
+FIREBASE_PASSWORD = os.environ.get("FIREBASE_PASSWORD", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production")
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "https://flashsmart8.github.io")
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_TRANSIT_KEY", "")
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("myday")
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+# ──────────────────────────────────────────────
+#  Firebase helpers
+# ──────────────────────────────────────────────
+_fb_token = {"id": None, "exp": 0}
+
+
+async def fb_auth() -> str:
+    """Get Firebase ID token, refresh if expired."""
+    now = time.time()
+    if _fb_token["id"] and _fb_token["exp"] > now + 60:
+        return _fb_token["id"]
+
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
+    payload = {"email": FIREBASE_EMAIL, "password": FIREBASE_PASSWORD, "returnSecureToken": True}
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            log.error("Firebase auth failed: %s", r.text)
+            raise HTTPException(500, "Firebase auth error")
+        data = r.json()
+
+    _fb_token["id"] = data["idToken"]
+    _fb_token["exp"] = now + int(data.get("expiresIn", 3600))
+    return _fb_token["id"]
+
+
+async def fb_get(path: str) -> dict | list | None:
+    token = await fb_auth()
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, timeout=10)
+        if r.status_code == 401:
+            _fb_token["id"] = None
+            token = await fb_auth()
+            r = await client.get(f"{FIREBASE_DB_URL}/{path}.json?auth={token}", timeout=10)
+        return r.json() if r.status_code == 200 else None
+
+
+async def fb_put(path: str, data: dict) -> bool:
+    token = await fb_auth()
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
+    async with httpx.AsyncClient() as client:
+        r = await client.put(url, json=data, timeout=10)
+        return r.status_code == 200
+
+
+async def fb_patch(path: str, data: dict) -> bool:
+    token = await fb_auth()
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(url, json=data, timeout=10)
+        return r.status_code == 200
+
+
+async def fb_post(path: str, data: dict) -> str | None:
+    """Push new item, return generated key."""
+    token = await fb_auth()
+    url = f"{FIREBASE_DB_URL}/{path}.json?auth={token}"
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, json=data, timeout=10)
+        if r.status_code == 200:
+            return r.json().get("name")
+    return None
+
+
+# ──────────────────────────────────────────────
+#  JWT helpers
+# ──────────────────────────────────────────────
+def create_jwt(user_id: str = "owner") -> str:
+    payload = {
+        "sub": user_id,
+        "exp": datetime.utcnow() + timedelta(hours=24),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def verify_jwt(token: str) -> str:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload["sub"]
+    except JWTError:
+        raise HTTPException(401, "Invalid or expired token")
+
+
+async def get_current_user(authorization: str = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing authorization")
+    token = authorization.split(" ", 1)[1]
+    return verify_jwt(token)
+
+
+# ──────────────────────────────────────────────
+#  Pydantic models
+# ──────────────────────────────────────────────
+class RegisterRequest(BaseModel):
+    credential_id: str
+    public_key: str
+    pin_hash: str  # bcrypt hash of 6-digit PIN, hashed on client
+
+
+class LoginRequest(BaseModel):
+    credential_id: str
+    signature: str
+    challenge: str
+    authenticator_data: str
+    client_data_json: str
+
+
+class PinLoginRequest(BaseModel):
+    pin: str
+
+
+class MessageRequest(BaseModel):
+    text: str  # plaintext message (MVP - HTTPS protects transit)
+
+
+class PushRegisterRequest(BaseModel):
+    subscription: str  # JSON-stringified PushSubscription
+
+
+# ──────────────────────────────────────────────
+#  App lifecycle
+# ──────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Starting Мій день server...")
+    start_scheduler()
+    yield
+    log.info("Shutting down...")
+
+
+app = FastAPI(title="Мій день API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
+# ──────────────────────────────────────────────
+#  Challenge store (in-memory, short-lived)
+# ──────────────────────────────────────────────
+_challenges: dict[str, float] = {}
+
+
+def create_challenge() -> str:
+    c = secrets.token_urlsafe(32)
+    _challenges[c] = time.time() + 300  # 5 min TTL
+    # cleanup old
+    now = time.time()
+    for k in list(_challenges):
+        if _challenges[k] < now:
+            del _challenges[k]
+    return c
+
+
+def verify_challenge(c: str) -> bool:
+    if c in _challenges and _challenges[c] > time.time():
+        del _challenges[c]
+        return True
+    return False
+
+
+# ──────────────────────────────────────────────
+#  Auth endpoints
+# ──────────────────────────────────────────────
+@app.get("/auth/challenge")
+async def get_challenge():
+    """Generate challenge for Passkey registration or login."""
+    return {"challenge": create_challenge()}
+
+
+@app.post("/auth/register")
+async def register(req: RegisterRequest):
+    """Store Passkey public key and PIN hash."""
+    existing = await fb_get("user/passkey")
+    if existing:
+        raise HTTPException(400, "Already registered. Use /auth/login.")
+
+    await fb_put("user/passkey", {
+        "credential_id": req.credential_id,
+        "public_key": req.public_key,
+        "created": int(time.time() * 1000),
+    })
+    await fb_put("user/pin_hash", {"hash": req.pin_hash})
+
+    token = create_jwt()
+    return {"token": token, "message": "Registered successfully"}
+
+
+@app.post("/auth/login")
+async def login(req: LoginRequest):
+    """Verify Passkey signature and issue JWT."""
+    if not verify_challenge(req.challenge):
+        raise HTTPException(401, "Invalid or expired challenge")
+
+    stored = await fb_get("user/passkey")
+    if not stored:
+        raise HTTPException(404, "Not registered")
+
+    if stored.get("credential_id") != req.credential_id:
+        raise HTTPException(401, "Unknown credential")
+
+    # In production: verify signature with stored public key using pywebauthn
+    # For MVP: credential_id match + valid challenge = authenticated
+    # TODO: full WebAuthn signature verification
+
+    token = create_jwt()
+    return {"token": token}
+
+
+@app.post("/auth/pin-login")
+async def pin_login(req: PinLoginRequest):
+    """Fallback login with PIN. Client sends SHA-256 hash, we compare strings."""
+    stored = await fb_get("user/pin_hash")
+    if not stored:
+        raise HTTPException(404, "Not registered")
+
+    stored_hash = stored.get("hash", "")
+    if not stored_hash or req.pin != stored_hash:
+        raise HTTPException(401, "Wrong PIN")
+
+    token = create_jwt()
+    return {"token": token}
+
+
+# ──────────────────────────────────────────────
+#  Message endpoint
+# ──────────────────────────────────────────────
+@app.post("/message")
+async def handle_message(req: MessageRequest, user: str = Depends(get_current_user)):
+    """Process message through Claude, save result encrypted in Firebase."""
+    plaintext = req.text
+
+    # Get context for Claude
+    settings = await fb_get("user/settings") or {}
+    city = settings.get("city", "Київ")
+
+    weather = {}
+    try:
+        weather = await get_weather(city)
+    except Exception as e:
+        log.warning("Weather fetch failed: %s", e)
+
+    holidays = get_today_holidays()
+
+    # Get recent facts for context
+    facts = await fb_get("facts") or {}
+    facts_summary = []
+    for fid, fdata in (facts.items() if isinstance(facts, dict) else []):
+        try:
+            decrypted_fact = decrypt_data(fdata.get("data", ""), ENCRYPTION_KEY)
+            facts_summary.append(f"[{fdata.get('category', '?')}] {decrypted_fact}")
+        except Exception:
+            pass
+
+    # Parse intent with Claude
+    result = await parse_intent(
+        message=plaintext,
+        weather=weather,
+        holidays=holidays,
+        known_facts=facts_summary[-20:],
+    )
+
+    # Save parsed data to Firebase (encrypted at rest)
+    if result["type"] == "EVENT":
+        encrypted_data = encrypt_data(json.dumps(result["data"], ensure_ascii=False), ENCRYPTION_KEY)
+        await fb_post("events", {
+            "data": encrypted_data,
+            "date": result["data"].get("date", ""),
+            "done": False,
+            "created": int(time.time() * 1000),
+        })
+
+    elif result["type"] == "FACT":
+        encrypted_data = encrypt_data(json.dumps(result["data"], ensure_ascii=False), ENCRYPTION_KEY)
+        await fb_post("facts", {
+            "data": encrypted_data,
+            "category": result["data"].get("category", "other"),
+            "created": int(time.time() * 1000),
+        })
+
+    elif result["type"] == "JOURNAL":
+        encrypted_data = encrypt_data(json.dumps(result["data"], ensure_ascii=False), ENCRYPTION_KEY)
+        today_key = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+        await fb_put(f"journal/{today_key}", {
+            "data": encrypted_data,
+            "mood": result["data"].get("mood", 3),
+            "created": int(time.time() * 1000),
+        })
+
+    elif result["type"] == "GOAL":
+        encrypted_data = encrypt_data(json.dumps(result["data"], ensure_ascii=False), ENCRYPTION_KEY)
+        await fb_post("goals", {
+            "data": encrypted_data,
+            "active": True,
+            "created": int(time.time() * 1000),
+        })
+
+    # Save chat history (both user message and bot response, encrypted)
+    now_ms = int(time.time() * 1000)
+    try:
+        chat_payload = {
+            "user": plaintext,
+            "bot": result["response"],
+            "type": result["type"],
+        }
+        encrypted_chat = encrypt_data(json.dumps(chat_payload, ensure_ascii=False), ENCRYPTION_KEY)
+        await fb_post("chat", {
+            "data": encrypted_chat,
+            "created": now_ms,
+        })
+    except Exception as e:
+        log.warning("Chat history save failed: %s", e)
+
+    return {
+        "response": result["response"],
+        "type": result["type"],
+    }
+
+
+# ──────────────────────────────────────────────
+#  Chat history endpoint
+# ──────────────────────────────────────────────
+@app.get("/chat-history")
+async def get_chat_history(user: str = Depends(get_current_user), limit: int = 50):
+    """Return last N chat messages, decrypted, in chronological order."""
+    chat = await fb_get("chat") or {}
+
+    if not isinstance(chat, dict):
+        return {"messages": []}
+
+    # Sort by created timestamp (ascending), take last N
+    items = []
+    for cid, cdata in chat.items():
+        if not isinstance(cdata, dict):
+            continue
+        try:
+            decrypted = json.loads(decrypt_data(cdata.get("data", ""), ENCRYPTION_KEY))
+            items.append({
+                "id": cid,
+                "created": cdata.get("created", 0),
+                "user": decrypted.get("user", ""),
+                "bot": decrypted.get("bot", ""),
+                "type": decrypted.get("type", "CHAT"),
+            })
+        except Exception as e:
+            log.warning("Decrypt chat failed: %s", e)
+
+    items.sort(key=lambda x: x["created"])
+    # Keep last N
+    items = items[-limit:]
+
+    return {"messages": items}
+
+
+# ──────────────────────────────────────────────
+#  Briefing endpoint
+# ──────────────────────────────────────────────
+@app.get("/briefing")
+async def get_briefing(user: str = Depends(get_current_user)):
+    """Generate morning/evening briefing."""
+    settings = await fb_get("user/settings") or {}
+    city = settings.get("city", "Київ")
+
+    weather = {}
+    try:
+        weather = await get_weather(city)
+    except Exception:
+        pass
+
+    holidays = get_today_holidays()
+
+    # Today's events
+    today = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+    events = await fb_get("events") or {}
+    today_events = []
+    for eid, edata in (events.items() if isinstance(events, dict) else []):
+        if edata.get("date") == today and not edata.get("done"):
+            try:
+                decrypted = decrypt_data(edata.get("data", ""), ENCRYPTION_KEY)
+                today_events.append(json.loads(decrypted))
+            except Exception:
+                pass
+
+    # Recent mood
+    journal = await fb_get("journal") or {}
+    recent_moods = []
+    for jkey in sorted(journal.keys() if isinstance(journal, dict) else [], reverse=True)[:7]:
+        jdata = journal[jkey]
+        if isinstance(jdata, dict) and "mood" in jdata:
+            recent_moods.append({"date": jkey, "mood": jdata["mood"]})
+
+    # Active goals
+    goals = await fb_get("goals") or {}
+    active_goals = []
+    for gid, gdata in (goals.items() if isinstance(goals, dict) else []):
+        if gdata.get("active"):
+            try:
+                decrypted = decrypt_data(gdata.get("data", ""), ENCRYPTION_KEY)
+                active_goals.append(json.loads(decrypted))
+            except Exception:
+                pass
+
+    briefing_text = await generate_briefing(
+        weather=weather,
+        holidays=holidays,
+        events=today_events,
+        moods=recent_moods,
+        goals=active_goals,
+    )
+
+    encrypted_briefing = encrypt_data(briefing_text, ENCRYPTION_KEY)
+    return {"encrypted_briefing": encrypted_briefing, "weather": weather}
+
+
+# ──────────────────────────────────────────────
+#  Today endpoint
+# ──────────────────────────────────────────────
+@app.get("/today")
+async def get_today(user: str = Depends(get_current_user)):
+    """Get today's events, weather, goals, moods (all decrypted for MVP)."""
+    settings = await fb_get("user/settings") or {}
+    city = settings.get("city", "Київ")
+
+    weather = {}
+    try:
+        weather = await get_weather(city)
+    except Exception:
+        pass
+
+    holidays = get_today_holidays()
+
+    # Today's events (decrypted)
+    today = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+    events = await fb_get("events") or {}
+    today_events = []
+    for eid, edata in (events.items() if isinstance(events, dict) else []):
+        if edata.get("date") == today and not edata.get("done"):
+            try:
+                decrypted = json.loads(decrypt_data(edata.get("data", ""), ENCRYPTION_KEY))
+                today_events.append({
+                    "id": eid,
+                    "text": decrypted.get("text", ""),
+                    "time": decrypted.get("time", ""),
+                })
+            except Exception as e:
+                log.warning("Decrypt event failed: %s", e)
+
+    # Active goals (decrypted)
+    goals = await fb_get("goals") or {}
+    active_goals = []
+    for gid, gdata in (goals.items() if isinstance(goals, dict) else []):
+        if gdata.get("active"):
+            try:
+                decrypted = json.loads(decrypt_data(gdata.get("data", ""), ENCRYPTION_KEY))
+                active_goals.append({
+                    "id": gid,
+                    "text": decrypted.get("text", ""),
+                    "frequency": decrypted.get("frequency", ""),
+                })
+            except Exception as e:
+                log.warning("Decrypt goal failed: %s", e)
+
+    # Recent moods (last 7 days)
+    journal = await fb_get("journal") or {}
+    recent_moods = []
+    for jkey in sorted(journal.keys() if isinstance(journal, dict) else [], reverse=True)[:7]:
+        jdata = journal[jkey]
+        if isinstance(jdata, dict) and "mood" in jdata:
+            recent_moods.append({"date": jkey, "mood": jdata["mood"]})
+
+    return {
+        "weather": weather,
+        "holidays": holidays,
+        "events": today_events,
+        "goals": active_goals,
+        "moods": recent_moods,
+    }
+
+
+# ──────────────────────────────────────────────
+#  Facts & Goals endpoints
+# ──────────────────────────────────────────────
+@app.get("/facts")
+async def get_facts(user: str = Depends(get_current_user)):
+    facts = await fb_get("facts") or {}
+    return {"facts": facts}
+
+
+@app.get("/goals")
+async def get_goals(user: str = Depends(get_current_user)):
+    goals = await fb_get("goals") or {}
+    return {"goals": goals}
+
+
+# ──────────────────────────────────────────────
+#  Push registration
+# ──────────────────────────────────────────────
+@app.get("/push/public-key")
+async def get_vapid_public_key():
+    """Return VAPID public key for client to subscribe."""
+    return {"public_key": os.environ.get("VAPID_PUBLIC_KEY", "")}
+
+
+@app.post("/push/register")
+async def register_push(req: PushRegisterRequest, user: str = Depends(get_current_user)):
+    """Save push subscription for the user."""
+    await fb_put("user/push_subscription", {
+        "subscription": req.subscription,
+        "updated": int(time.time() * 1000),
+    })
+    return {"ok": True}
+
+
+@app.post("/push/test")
+async def test_push(user: str = Depends(get_current_user)):
+    """Send a test push to verify setup (not saved to chat)."""
+    from push_service import send_push
+    success = await send_push(
+        title="Мій день",
+        body="Тестове повідомлення — push працює! 🎉",
+        tag="test",
+        save_to_chat=False,
+    )
+    return {"ok": success}
+
+
+@app.post("/push/test-briefing")
+async def test_briefing(user: str = Depends(get_current_user)):
+    """Generate a real briefing and send as push + save to chat."""
+    from push_service import send_push
+
+    settings = await fb_get("user/settings") or {}
+    city = settings.get("city", "Київ")
+
+    weather = {}
+    try:
+        weather = await get_weather(city)
+    except Exception as e:
+        log.warning("Weather fetch failed: %s", e)
+
+    holidays = get_today_holidays()
+
+    # Today's events
+    today = datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+    events = await fb_get("events") or {}
+    today_events = []
+    for eid, edata in (events.items() if isinstance(events, dict) else []):
+        if edata.get("date") == today and not edata.get("done"):
+            try:
+                decrypted = json.loads(decrypt_data(edata.get("data", ""), ENCRYPTION_KEY))
+                today_events.append(decrypted)
+            except Exception:
+                pass
+
+    # Active goals
+    goals = await fb_get("goals") or {}
+    active_goals = []
+    for gid, gdata in (goals.items() if isinstance(goals, dict) else []):
+        if gdata.get("active"):
+            try:
+                decrypted = json.loads(decrypt_data(gdata.get("data", ""), ENCRYPTION_KEY))
+                active_goals.append(decrypted)
+            except Exception:
+                pass
+
+    # Recent moods
+    journal = await fb_get("journal") or {}
+    recent_moods = []
+    for jkey in sorted(journal.keys() if isinstance(journal, dict) else [], reverse=True)[:7]:
+        jdata = journal[jkey]
+        if isinstance(jdata, dict) and "mood" in jdata:
+            recent_moods.append({"date": jkey, "mood": jdata["mood"]})
+
+    # Generate briefing text via Claude
+    briefing_text = await generate_briefing(
+        weather=weather,
+        holidays=holidays,
+        events=today_events,
+        moods=recent_moods,
+        goals=active_goals,
+    )
+
+    # Send push + save to chat
+    push_sent = await send_push(
+        title="Мій день — брифінг",
+        body=briefing_text,
+        tag="briefing",
+        save_to_chat=True,
+    )
+
+    return {"ok": push_sent, "briefing": briefing_text}
+
+
+# ──────────────────────────────────────────────
+#  Health check
+# ──────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "myday", "time": datetime.now(KYIV_TZ).isoformat()}
